@@ -75,6 +75,73 @@ async def _safe_api_call(func, *args, operation_type: str = "api", **kwargs):
         logger.debug(f"[PROD] Calling {func.__name__ if hasattr(func, '__name__') else 'function'} via safe_call")
         return await safe_call(func, operation_type=operation_type, *args, **kwargs)
 
+def _peer_id(peer) -> Optional[int]:
+    """Числовой id из Peer* без предположения о типе (user / channel / chat)."""
+    if peer is None:
+        return None
+    for attr in ('user_id', 'channel_id', 'chat_id'):
+        value = getattr(peer, attr, None)
+        if value is not None:
+            return value
+    return None
+
+
+def _message_to_dict(msg) -> Dict[str, Any]:
+    """Сериализует telethon Message в словарь (общий формат для get_messages и get_post_comments)."""
+    # Extract fwd_from info
+    fwd_from = None
+    if msg.fwd_from:
+        fwd = msg.fwd_from
+        fwd_from = {
+            'from_id': None,
+            'from_type': None,
+            'from_name': fwd.from_name,
+            'from_username': None,
+            'from_first_name': None,
+            'from_last_name': None,
+            'date': fwd.date.isoformat() if fwd.date else None,
+            'channel_post': fwd.channel_post,
+        }
+        if fwd.from_id:
+            from telethon.tl.types import PeerUser, PeerChannel, PeerChat
+            if isinstance(fwd.from_id, PeerUser):
+                fwd_from['from_id'] = fwd.from_id.user_id
+                fwd_from['from_type'] = 'user'
+            elif isinstance(fwd.from_id, PeerChannel):
+                fwd_from['from_id'] = fwd.from_id.channel_id
+                fwd_from['from_type'] = 'channel'
+            elif isinstance(fwd.from_id, PeerChat):
+                fwd_from['from_id'] = fwd.from_id.chat_id
+                fwd_from['from_type'] = 'chat'
+        # Resolve name/username from cached entities (no extra API calls)
+        # msg.forward.sender/.chat are populated from the iter_messages response
+        if msg.forward:
+            fwd_entity = msg.forward.sender or msg.forward.chat
+            if fwd_entity:
+                fwd_from['from_username'] = getattr(fwd_entity, 'username', None)
+                fwd_from['from_first_name'] = getattr(fwd_entity, 'first_name', None)
+                fwd_from['from_last_name'] = getattr(fwd_entity, 'last_name', None)
+
+    replies = getattr(msg, 'replies', None)
+    return {
+        'id': msg.id,
+        'date': msg.date.isoformat() if msg.date else None,
+        # В группах обсуждения автор может быть каналом (авто-форвард поста) — не падаем на .user_id
+        'from_id': _peer_id(msg.from_id),
+        'text': msg.message or '',
+        'fwd_from': fwd_from,
+        'is_reply': msg.reply_to is not None,
+        'reply_to_msg_id': msg.reply_to.reply_to_msg_id if msg.reply_to else None,
+        'views': getattr(msg, 'views', None),
+        'forwards': getattr(msg, 'forwards', None),
+        # Число комментариев к посту канала (None, если у поста нет обсуждения)
+        'replies_count': getattr(replies, 'replies', None) if replies is not None else None,
+        'is_pinned': getattr(msg, 'is_pinned', False),
+        'has_media': msg.media is not None,
+        'media_type': type(msg.media).__name__ if msg.media else None,
+    }
+
+
 class GroupManager:
     """Менеджер для работы с группами Telegram"""
     
@@ -515,57 +582,8 @@ class GroupManager:
                     # Пропускаем служебные сообщения
                     if not msg.message and not msg.media:
                         continue
-                    
-                    # Extract fwd_from info
-                    fwd_from = None
-                    if msg.fwd_from:
-                        fwd = msg.fwd_from
-                        fwd_from = {
-                            'from_id': None,
-                            'from_type': None,
-                            'from_name': fwd.from_name,
-                            'from_username': None,
-                            'from_first_name': None,
-                            'from_last_name': None,
-                            'date': fwd.date.isoformat() if fwd.date else None,
-                            'channel_post': fwd.channel_post,
-                        }
-                        if fwd.from_id:
-                            from telethon.tl.types import PeerUser, PeerChannel, PeerChat
-                            if isinstance(fwd.from_id, PeerUser):
-                                fwd_from['from_id'] = fwd.from_id.user_id
-                                fwd_from['from_type'] = 'user'
-                            elif isinstance(fwd.from_id, PeerChannel):
-                                fwd_from['from_id'] = fwd.from_id.channel_id
-                                fwd_from['from_type'] = 'channel'
-                            elif isinstance(fwd.from_id, PeerChat):
-                                fwd_from['from_id'] = fwd.from_id.chat_id
-                                fwd_from['from_type'] = 'chat'
-                        # Resolve name/username from cached entities (no extra API calls)
-                        # msg.forward.sender/.chat are populated from the iter_messages response
-                        if msg.forward:
-                            fwd_entity = msg.forward.sender or msg.forward.chat
-                            if fwd_entity:
-                                fwd_from['from_username'] = getattr(fwd_entity, 'username', None)
-                                fwd_from['from_first_name'] = getattr(fwd_entity, 'first_name', None)
-                                fwd_from['from_last_name'] = getattr(fwd_entity, 'last_name', None)
 
-                    message_data = {
-                        'id': msg.id,
-                        'date': msg.date.isoformat() if msg.date else None,
-                        'from_id': msg.from_id.user_id if msg.from_id else None,
-                        'text': msg.message or '',
-                        'fwd_from': fwd_from,
-                        'is_reply': msg.reply_to is not None,
-                        'reply_to_msg_id': msg.reply_to.reply_to_msg_id if msg.reply_to else None,
-                        'views': getattr(msg, 'views', None),
-                        'forwards': getattr(msg, 'forwards', None),
-                        'is_pinned': getattr(msg, 'is_pinned', False),
-                        'has_media': msg.media is not None,
-                        'media_type': type(msg.media).__name__ if msg.media else None,
-                    }
-                    
-                    messages.append(message_data)
+                    messages.append(_message_to_dict(msg))
                     count += 1
                     
                     # Smart pause каждые 1000 сообщений
@@ -587,7 +605,73 @@ class GroupManager:
         except Exception as e:
             logger.error(f"Ошибка при получении сообщений группы {group_identifier}: {e}")
             return []
-    
+
+    async def get_post_comments(
+        self,
+        group_identifier: Union[str, int],
+        post_id: int,
+        limit: Optional[int] = None,
+        min_id: int = 0,
+    ) -> List[Dict[str, Any]]:
+        """
+        Получает комментарии к посту канала (messages.getReplies).
+
+        Комментарии живут в связанной группе обсуждения, но этот вызов работает через сам канал:
+        вступать в группу обсуждения не нужно, достаточно доступа к каналу.
+
+        Args:
+            group_identifier: username канала (без @) или ID канала
+            post_id: ID поста в канале
+            limit: Максимальное количество комментариев (None = все)
+            min_id: Минимальный ID комментария (для инкрементального чтения)
+
+        Returns:
+            Список словарей с комментариями (формат тот же, что у get_messages).
+            reply_to_msg_id у комментария указывает либо на пост, либо на другой комментарий.
+        """
+        is_valid, error_msg = _validate_group_identifier(group_identifier)
+        if not is_valid:
+            logger.error(f"Validation failed: {error_msg}")
+            return []
+
+        try:
+            if isinstance(group_identifier, int):
+                entity_id = group_identifier
+            elif isinstance(group_identifier, str) and (group_identifier.startswith('-') and group_identifier[1:].isdigit()):
+                entity_id = int(group_identifier)
+            else:
+                entity_id = group_identifier if group_identifier.startswith('@') else '@' + group_identifier
+
+            entity = await _safe_api_call(self.client.get_entity, entity_id)
+
+            async def fetch_comments_safe():
+                comments = []
+                count = 0
+                async for msg in self.client.iter_messages(
+                    entity,
+                    limit=limit,
+                    min_id=min_id,
+                    reply_to=post_id,
+                    reverse=False,
+                ):
+                    if not msg.message and not msg.media:
+                        continue
+                    comments.append(_message_to_dict(msg))
+                    count += 1
+                    if count % 1000 == 0:
+                        await smart_pause("participants", count)
+                    if limit and count >= limit:
+                        break
+                return comments
+
+            comments = await _safe_api_call(fetch_comments_safe)
+            logger.info(f"Получено {len(comments)} комментариев к посту {post_id} в {group_identifier}")
+            return comments
+
+        except Exception as e:
+            logger.error(f"Ошибка при получении комментариев к посту {post_id} в {group_identifier}: {e}")
+            return []
+
     async def get_my_dialogs(self, limit: int = 100, dialog_type: str = "all") -> List[Dict[str, Any]]:
         """
         Получает список диалогов (групп/каналов/личных чатов) текущего аккаунта.

@@ -74,6 +74,16 @@ async def tg_get_messages(group: str, limit: int = 100, min_id: int = 0) -> dict
 
 
 @mcp.tool()
+async def tg_get_post_comments(group: str, post_id: int, limit: int = 100, min_id: int = 0) -> dict:
+    """Get comments to a channel post (the 'discussion' under a post). Works via the channel itself —
+    no need to join the linked discussion group. Same message format as tg_get_messages;
+    reply_to_msg_id points either to the post or to another comment. Use min_id for incremental reads."""
+    manager = await ctx.get_manager()
+    comments = await manager.get_post_comments(group, post_id, limit=limit, min_id=min_id)
+    return {"group": group, "post_id": post_id, "count": len(comments), "comments": comments}
+
+
+@mcp.tool()
 async def tg_get_message_count(group: str) -> dict:
     """Get total number of messages in a Telegram group."""
     manager = await ctx.get_manager()
