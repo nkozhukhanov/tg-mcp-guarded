@@ -34,6 +34,9 @@ Action MCP is fail-closed: if baseline is weakened, writes are auto-blocked unle
 | `TG_ACTIONS_BATCH_APPROVAL_LEASE_SEC` | `86400` | shorten/extend | one-time approval window |
 | `TG_ACTIONS_BATCH_RUN_LEASE_SEC` | `1800` | increase | very long batch worker runs |
 | `TG_SESSION_LOCK_MODE` | `shared` | `exclusive` | strict one-process-per-session |
+| `TG_IDLE_DISCONNECT_SEC` | `120` | shorten/`0` | release shared `.session` file sooner / never |
+| `TG_SESSION_WAL` | `1` | `0` | keep legacy rollback journal for the `.session` sqlite |
+| `TG_SESSION_BUSY_TIMEOUT_MS` | `15000` | raise | tolerate longer lock waits on a busy shared session |
 | `TG_GLOBAL_RPS_MODE` | `shared` | `local` | isolated throttling per project |
 
 ## Safe Change Procedure

@@ -4,8 +4,10 @@ import atexit
 import shlex
 import subprocess
 import sys
+import time
 from pathlib import Path
 from telethon import TelegramClient
+from telethon.sessions import SQLiteSession
 from telethon.errors import SessionPasswordNeededError, PhoneCodeInvalidError
 from dotenv import load_dotenv
 from telethon.tl.types import User
@@ -30,6 +32,17 @@ SESSION_DIR = Path(os.getenv("SESSION_DIR", "data/sessions"))
 SESSION_DIR.mkdir(parents=True, exist_ok=True)
 SESSION_LOCK_MODE = os.getenv("TG_SESSION_LOCK_MODE", "shared").strip().lower()
 RECEIVE_UPDATES = os.getenv("TG_RECEIVE_UPDATES", "0") == "1"
+
+# Session-file contention controls (see README "Session Concurrency").
+# busy_timeout: how long sqlite waits for a lock held by another process before
+# raising "database is locked" (Telethon's default is 5s).
+try:
+    SESSION_BUSY_TIMEOUT_MS = int(os.getenv("TG_SESSION_BUSY_TIMEOUT_MS", "15000"))
+except ValueError:
+    SESSION_BUSY_TIMEOUT_MS = 15000
+# WAL journal: readers never block on a writer, and a crashed writer leaves a
+# -wal file that sqlite replays on next open instead of a hot -journal.
+SESSION_WAL_ENABLED = os.getenv("TG_SESSION_WAL", "1") == "1"
 
 WRITE_GUARD_ENABLED = os.getenv("TG_BLOCK_DIRECT_TELETHON_WRITE", "1") == "1"
 ALLOW_DIRECT_WRITE = os.getenv("TG_ALLOW_DIRECT_TELETHON_WRITE", "0") == "1"
@@ -266,13 +279,106 @@ def _raise_write_guard_error(method_name: str) -> None:
     )
 
 
+class GuardedSQLiteSession(SQLiteSession):
+    """SQLiteSession that applies busy_timeout / WAL every time the connection is (re)opened.
+
+    Telethon closes the sqlite connection in ``client.disconnect()`` and reopens it
+    lazily in ``_cursor()``; per-connection pragmas (busy_timeout) must therefore be
+    re-applied on every open, not just once in ``__init__``.
+    """
+
+    def _cursor(self):
+        fresh = self._conn is None
+        cursor = super()._cursor()
+        if fresh:
+            self._apply_connection_pragmas()
+        return cursor
+
+    def _apply_connection_pragmas(self) -> None:
+        conn = self._conn
+        if conn is None or self.filename == ":memory:":
+            return
+        try:
+            conn.execute(f"PRAGMA busy_timeout={int(SESSION_BUSY_TIMEOUT_MS)}")
+        except Exception:
+            pass
+        if SESSION_WAL_ENABLED:
+            try:
+                # Persistent (stored in the db header); fails harmlessly if another
+                # process holds a lock right now — the next open will retry.
+                conn.execute("PRAGMA journal_mode=WAL").fetchone()
+            except Exception:
+                pass
+
+
 class GuardedTelegramClient(TelegramClient):
-    """TelegramClient with default-deny write guard outside Action MCP."""
+    """TelegramClient with default-deny write guard outside Action MCP.
+
+    Also tracks activity so that the owning process can release the session file
+    while idle (``disconnect_if_idle``) and transparently reconnect on the next
+    request (``__call__`` -> ``connect()``).
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._guard_conn_lock = asyncio.Lock()
+        self._guard_inflight = 0
+        self._guard_last_activity = time.monotonic()
+
+    # --- activity tracking -------------------------------------------------
+    def touch(self) -> None:
+        """Mark the client as recently used (postpones idle disconnect)."""
+        self._guard_last_activity = time.monotonic()
+
+    @property
+    def inflight(self) -> int:
+        """Number of Telegram requests currently in progress."""
+        return self._guard_inflight
+
+    def idle_seconds(self) -> float:
+        return time.monotonic() - self._guard_last_activity
+
+    async def ensure_connected(self) -> None:
+        """Connect if the client was disconnected (e.g. released while idle)."""
+        async with self._guard_conn_lock:
+            if not self.is_connected():
+                await self.connect()
+            self.touch()
+
+    async def disconnect_if_idle(self, idle_sec: float) -> bool:
+        """Disconnect (and close the sqlite session file) if idle for >= idle_sec.
+
+        Returns True when the connection was actually released. Never interrupts a
+        request in flight: the check and the disconnect run under the same lock that
+        ``__call__`` takes before sending.
+        """
+        async with self._guard_conn_lock:
+            if not self.is_connected():
+                return False
+            if self._guard_inflight > 0 or self.idle_seconds() < idle_sec:
+                return False
+            await self.disconnect()
+            return True
+
+    async def _guard_begin(self) -> None:
+        async with self._guard_conn_lock:
+            if not self.is_connected():
+                await self.connect()
+            self._guard_inflight += 1
+            self.touch()
+
+    def _guard_end(self) -> None:
+        self._guard_inflight = max(0, self._guard_inflight - 1)
+        self.touch()
 
     async def __call__(self, request, *args, **kwargs):
         if _contains_telethon_write_request(request) and not _is_direct_write_allowed():
             _raise_write_guard_error(request.__class__.__name__)
-        return await super().__call__(request, *args, **kwargs)
+        await self._guard_begin()
+        try:
+            return await super().__call__(request, *args, **kwargs)
+        finally:
+            self._guard_end()
 
     async def send_message(self, *args, **kwargs):
         if not _is_direct_write_allowed():
@@ -360,7 +466,9 @@ def get_client():
         _acquire_session_lock(session_file)
         # Усиливаем права хранилища перед созданием клиента
         _harden_session_storage(SESSION_DIR, session_file)
-        _client = GuardedTelegramClient(session_path, api_id, api_hash, receive_updates=RECEIVE_UPDATES)
+        _client = GuardedTelegramClient(
+            GuardedSQLiteSession(session_path), api_id, api_hash, receive_updates=RECEIVE_UPDATES
+        )
     return _client
 
 def get_client_for_session(custom_session_file_path: str):
@@ -384,7 +492,7 @@ def get_client_for_session(custom_session_file_path: str):
         # Telethon appends .session automatically — strip it to avoid double extension
         session_name = str(resolved.with_suffix("")) if resolved.suffix == ".session" else str(resolved)
         client = GuardedTelegramClient(
-            session_name,
+            GuardedSQLiteSession(session_name),
             api_id,
             api_hash,
             receive_updates=RECEIVE_UPDATES,

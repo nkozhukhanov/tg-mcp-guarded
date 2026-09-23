@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import glob
+import logging
 import os
 from typing import Any
 from pathlib import Path
@@ -13,6 +15,16 @@ load_dotenv()
 
 from tganalytics.domain.groups import GroupManager
 from tganalytics.infra.tele_client import get_client, get_client_for_session
+
+logger = logging.getLogger(__name__)
+
+# Release the Telegram connection (and the sqlite session file) after this many
+# seconds without tool calls; the next tool call reconnects transparently.
+# 0 disables idle release (old behaviour: hold the session file for process lifetime).
+try:
+    IDLE_DISCONNECT_SEC = float(os.environ.get("TG_IDLE_DISCONNECT_SEC", "120"))
+except ValueError:
+    IDLE_DISCONNECT_SEC = 120.0
 
 
 def _expected_username() -> str:
@@ -45,16 +57,28 @@ def _validate_expected_account(me: Any) -> str | None:
 class MCPServerContext:
     """Shared runtime state for MCP servers.
 
-    Keeps one active Telegram client/session per server process.
+    Keeps one active Telegram client/session per server process. The client is
+    created and connected lazily on the first tool call, and released again after
+    ``idle_disconnect_sec`` without calls so that idle MCP processes (one pair per
+    Claude session) do not keep the shared sqlite session file open.
     """
 
-    def __init__(self, sessions_dir: str | None = None, allow_session_switch: bool = True):
+    def __init__(
+        self,
+        sessions_dir: str | None = None,
+        allow_session_switch: bool = True,
+        idle_disconnect_sec: float | None = None,
+    ):
         self.sessions_dir = sessions_dir or os.environ.get("TG_SESSIONS_DIR", "data/sessions")
         self.allow_session_switch = allow_session_switch
+        self.idle_disconnect_sec = (
+            IDLE_DISCONNECT_SEC if idle_disconnect_sec is None else float(idle_disconnect_sec)
+        )
 
         self._client = None
         self._manager: GroupManager | None = None
         self._current_session: str | None = None
+        self._idle_task: asyncio.Task | None = None
 
     @property
     def current_session(self) -> str | None:
@@ -83,10 +107,11 @@ class MCPServerContext:
         self._client = client
         self._current_session = session_name
         self._manager = GroupManager(client)
+        self._start_idle_watchdog(client)
         return self._manager
 
     async def get_manager(self) -> GroupManager:
-        """Lazy-init manager and connect on the first call."""
+        """Lazy-init manager and connect on the first call; reconnect after idle release."""
         if self._manager is None:
             session_path = os.environ.get("TG_SESSION_PATH", "").strip()
             if session_path:
@@ -97,8 +122,63 @@ class MCPServerContext:
                 client = get_client()
 
             await self._connect_client(client, session_name)
+        else:
+            await self._reconnect_if_released()
 
         return self._manager
+
+    async def _reconnect_if_released(self) -> None:
+        """Re-open the connection if the idle watchdog released it."""
+        client = self._client
+        if client is None:
+            return
+        ensure_connected = getattr(client, "ensure_connected", None)
+        if ensure_connected is not None:
+            await ensure_connected()
+            return
+        is_connected = getattr(client, "is_connected", None)
+        if is_connected is not None and not is_connected():
+            await client.connect()
+
+    # --- idle release ---------------------------------------------------------
+    def _start_idle_watchdog(self, client: Any) -> None:
+        if self.idle_disconnect_sec <= 0:
+            return
+        if getattr(client, "disconnect_if_idle", None) is None:
+            return
+        if self._idle_task is not None and not self._idle_task.done():
+            return
+        self._idle_task = asyncio.get_running_loop().create_task(self._idle_watchdog())
+
+    async def _idle_watchdog(self) -> None:
+        # Poll a few times per idle window; cheap, and keeps the release latency bounded.
+        interval = max(0.05, min(self.idle_disconnect_sec / 4.0, 15.0))
+        while True:
+            await asyncio.sleep(interval)
+            client = self._client
+            if client is None:
+                continue
+            try:
+                await self.release_if_idle(client)
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning("Idle release of Telegram session failed: %s", exc)
+
+    async def release_if_idle(self, client: Any | None = None) -> bool:
+        """Disconnect the client (closing the sqlite session file) if idle long enough."""
+        client = client if client is not None else self._client
+        if client is None or self.idle_disconnect_sec <= 0:
+            return False
+        disconnect_if_idle = getattr(client, "disconnect_if_idle", None)
+        if disconnect_if_idle is None:
+            return False
+        released = await disconnect_if_idle(self.idle_disconnect_sec)
+        if released:
+            logger.info(
+                "Telegram session '%s' released after %.0fs idle; will reconnect on next call",
+                self._current_session,
+                self.idle_disconnect_sec,
+            )
+        return released
 
     async def list_sessions(self) -> dict[str, Any]:
         sessions = [
