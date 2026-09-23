@@ -306,6 +306,7 @@ Add to your project's `.mcp.json`:
 - `TG_RECEIVE_UPDATES=0` (default) disables Telethon updates loop to reduce sqlite session lock contention.
 - `TG_IDLE_DISCONNECT_SEC=120` (default): an MCP process connects on the first tool call and releases the connection (closing the sqlite `.session` file) after N seconds without calls; the next call reconnects transparently. Idle Claude sessions and an unused Actions server no longer hold the shared session file. `0` = hold for process lifetime (old behaviour).
 - `TG_SESSION_WAL=1` (default): keeps the sqlite session in WAL journal mode, so readers never block on a writer and a crashed writer leaves a replayable `-wal` instead of a hot `-journal`. Persistent per file; `0` leaves the journal mode untouched.
+- `TG_USE_IPV6=1`: connect to Telegram over IPv6. Use it when the IPv4 path (e.g. a VPN exit) drops MTProto addresses while native IPv6 is open; Telethon re-points the session to the DC's IPv6 address automatically and back again when the flag is off.
 - `TG_SESSION_BUSY_TIMEOUT_MS=15000` (default): how long sqlite waits for a lock held by another process before failing with `database is locked` (Telethon default is 5s).
 - `TG_GLOBAL_RPS_MODE=shared` applies one shared RPS budget across all processes using the same `data/anti_spam`.
 - `TG_FLOOD_CIRCUIT_THRESHOLD_SEC` + `TG_FLOOD_CIRCUIT_COOLDOWN_SEC` pause all calls after critical FLOOD_WAIT.

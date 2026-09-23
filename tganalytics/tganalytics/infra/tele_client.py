@@ -43,6 +43,9 @@ except ValueError:
 # WAL journal: readers never block on a writer, and a crashed writer leaves a
 # -wal file that sqlite replays on next open instead of a hot -journal.
 SESSION_WAL_ENABLED = os.getenv("TG_SESSION_WAL", "1") == "1"
+# Connect to Telegram DCs over IPv6. Useful when an IPv4 VPN/DPI path blocks the
+# MTProto addresses but native IPv6 is open (Telegram Desktop does the same).
+USE_IPV6 = os.getenv("TG_USE_IPV6", "0") == "1"
 
 WRITE_GUARD_ENABLED = os.getenv("TG_BLOCK_DIRECT_TELETHON_WRITE", "1") == "1"
 ALLOW_DIRECT_WRITE = os.getenv("TG_ALLOW_DIRECT_TELETHON_WRITE", "0") == "1"
@@ -467,7 +470,11 @@ def get_client():
         # Усиливаем права хранилища перед созданием клиента
         _harden_session_storage(SESSION_DIR, session_file)
         _client = GuardedTelegramClient(
-            GuardedSQLiteSession(session_path), api_id, api_hash, receive_updates=RECEIVE_UPDATES
+            GuardedSQLiteSession(session_path),
+            api_id,
+            api_hash,
+            receive_updates=RECEIVE_UPDATES,
+            use_ipv6=USE_IPV6,
         )
     return _client
 
@@ -496,6 +503,7 @@ def get_client_for_session(custom_session_file_path: str):
             api_id,
             api_hash,
             receive_updates=RECEIVE_UPDATES,
+            use_ipv6=USE_IPV6,
         )
         _clients_by_path[key] = client
     return client

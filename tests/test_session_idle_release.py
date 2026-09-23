@@ -187,3 +187,13 @@ async def test_context_idle_release_disabled_with_zero(monkeypatch):
     client.idle = 999.0
     assert await ctx.release_if_idle() is False
     assert client.connected is True
+
+
+# --- IPv6 toggle ------------------------------------------------------------------
+
+def test_use_ipv6_flag_is_passed_to_client(tmp_path, monkeypatch):
+    monkeypatch.setattr(tele_client, "USE_IPV6", True)
+    monkeypatch.setattr(tele_client, "SESSION_WAL_ENABLED", False)
+    client = tele_client.get_client_for_session(str(tmp_path / "ipv6_probe.session"))
+    assert client._use_ipv6 is True
+    client.session.close()

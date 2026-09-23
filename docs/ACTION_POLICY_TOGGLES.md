@@ -37,6 +37,7 @@ Action MCP is fail-closed: if baseline is weakened, writes are auto-blocked unle
 | `TG_IDLE_DISCONNECT_SEC` | `120` | shorten/`0` | release shared `.session` file sooner / never |
 | `TG_SESSION_WAL` | `1` | `0` | keep legacy rollback journal for the `.session` sqlite |
 | `TG_SESSION_BUSY_TIMEOUT_MS` | `15000` | raise | tolerate longer lock waits on a busy shared session |
+| `TG_USE_IPV6` | `0` | `1` | IPv4/VPN path drops MTProto, native IPv6 is open |
 | `TG_GLOBAL_RPS_MODE` | `shared` | `local` | isolated throttling per project |
 
 ## Safe Change Procedure
